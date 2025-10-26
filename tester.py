@@ -16,10 +16,13 @@ class Tester:
 
     def configure(self):
         print("\n--- TESTER CONFIGURATION ---")
+
         self.server_ip = input(f"Enter SERVER IP [{self.server_ip}]: ") or self.server_ip
         port_input = input(f"Enter SERVER PORT [{self.server_port}]: ")
+
         if port_input.strip():
             self.server_port = int(port_input)
+
         print(f"Configured SERVER_IP={self.server_ip}, SERVER_PORT={self.server_port}\n")
 
     def select_sensor_type(self):
@@ -28,6 +31,7 @@ class Tester:
         print("2. WindSense")
         print("3. RainDetect")
         print("4. AirQualityBox")
+
         choice = input("Select: ").strip()
         types = {
             "1": "ThermoNode",
@@ -98,7 +102,9 @@ class Tester:
             "low_battery": False,
             "data": self.generate_data()
         }
+
         self.send_json(msg)
+
         try:
             self.sock.settimeout(2)
             data, _ = self.sock.recvfrom(4096)
