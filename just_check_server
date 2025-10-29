@@ -1,0 +1,169 @@
+import socket
+import json
+import time
+
+# --- CRC-32 (IEEE) pure Python, no external libs ---
+def crc32_bytes(data: bytes) -> int:
+    crc = 0xFFFFFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            mask = -(crc & 1)
+            crc = (crc >> 1) ^ (0xEDB88320 & mask)
+    return crc ^ 0xFFFFFFFF
+
+def crc32_of_json_data(data_obj) -> int:
+    # canonical JSON of the 'data' field only: compact and sorted keys
+    payload = json.dumps(data_obj, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return crc32_bytes(payload) & 0xFFFFFFFF
+
+
+class Server:
+    def __init__(self):
+        self.server_ip = "127.0.0.1"
+        self.server_port = 5005
+        self.sock = None
+        # tokens per sensor_id
+        self.tokens = {}
+        # remember last known remote addr per sensor
+        self.sensor_addr = {}
+        self.listening = False
+        self._last_resend_req = {}
+
+    def configure(self):
+        print("\n--- SERVER CONFIGURATION ---")
+        self.server_ip = input(f"Enter IP [{self.server_ip}]: ") or self.server_ip
+        port_input = input(f"Enter PORT [{self.server_port}]: ")
+        if port_input.strip():
+            self.server_port = int(port_input)
+        print(f"Configured IP={self.server_ip}, PORT={self.server_port}\n")
+
+    def start_listening(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind((self.server_ip, self.server_port))
+        self.sock.settimeout(0.5)
+        self.listening = True
+        print(f"Server listening on {self.server_ip}:{self.server_port}\n")
+        self.listen_loop()
+
+    def listen_loop(self):
+        while self.listening:
+            try:
+                data, addr = self.sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            try:
+                message = json.loads(data.decode("utf-8", errors="ignore"))
+            except json.JSONDecodeError:
+                print("INFO: Corrupted message - invalid JSON")
+                continue
+
+            msg_type = message.get("type")
+            if msg_type == "register":
+                self.handle_register(message, addr)
+            elif msg_type == "data":
+                self.handle_data(message, addr)
+            else:
+                print(f"Unknown message type: {msg_type}")
+
+    def handle_register(self, message, addr):
+        sensor_id = message.get("sensor_id")
+        sensor_type = message.get("sensor_type", "UNKNOWN")
+        ts = message.get("timestamp", int(time.time()))
+
+        if not sensor_id:
+            print("INFO: register missing sensor_id, ignored")
+            return
+
+        token = f"TOKEN_{int(time.time())}"
+        self.tokens[sensor_id] = token
+        self.sensor_addr[sensor_id] = addr
+
+        print(f"INFO: {sensor_id} ({sensor_type}) REGISTERED at {ts}")
+        response = {
+            "type": "register_ack",
+            "sensor_id": sensor_id,
+            "token": token,
+            "timestamp": int(time.time()),
+        }
+        self.safe_send(addr, response)
+
+    def handle_data(self, message, addr):
+        sensor_id = message.get("sensor_id")
+        sensor_type = message.get("sensor_type", "UNKNOWN")
+        token = message.get("token")
+        ts = message.get("timestamp", int(time.time()))
+
+        if not sensor_id or not token:
+            print(f"INFO: DATA missing sensor_id or token at {ts}")
+            self.safe_send(addr, {"type": "invalid_token", "sensor_id": sensor_id, "timestamp": int(time.time())})
+            return
+
+        if self.tokens.get(sensor_id) != token:
+            print(f"INFO: {sensor_id} INVALID TOKEN at {ts}")
+            self.safe_send(addr, {"type": "invalid_token", "sensor_id": sensor_id, "timestamp": int(time.time())})
+            return
+
+        self.sensor_addr[sensor_id] = addr
+
+        data = message.get("data", {})
+        recv_crc = message.get("crc32",None)
+        calc_crc = crc32_of_json_data(data)
+
+        if recv_crc != calc_crc:
+            # exact wording required by spec (including the typo)
+            print(f"INFO: {sensor_id} CORRUTPED DATA at {ts}. REQUESTING DATA")
+            self.safe_send(addr, {
+                "type": "request_resend",
+                "sensor_id": sensor_id,
+                "timestamp": int(time.time())
+            })
+            return
+
+        if message.get("low_battery"):
+            print(f"{ts} - WARNING: LOW BATTERY {sensor_id} ({sensor_type})")
+        else:
+            print(f"{ts} - {sensor_id} ({sensor_type})")
+
+        line = "; ".join(f"{k}: {v}" for k, v in data.items())
+        print(line + "\n")
+
+        self.safe_send(addr, {"type": "data_ack", "sensor_id": sensor_id, "timestamp": int(time.time())})
+
+    def safe_send(self, addr, obj):
+        try:
+            self.sock.sendto(json.dumps(obj, separators=(",", ":")).encode("utf-8"), addr)
+        except OSError:
+            pass
+
+    def menu(self):
+        while True:
+            print("\n--- SERVER MENU ---")
+            print("1. Configure IP/PORT")
+            print("2. Start listening")
+            print("3. Exit")
+            choice = input("Select option: ").strip()
+
+            if choice == "1":
+                self.configure()
+            elif choice == "2":
+                self.start_listening()
+            elif choice == "3":
+                print("Server shutting down.")
+                self.listening = False
+                try:
+                    if self.sock:
+                        self.sock.close()
+                except OSError:
+                    pass
+                break
+            else:
+                print("Invalid choice.")
+
+
+if __name__ == "__main__":
+    server = Server()
+    server.menu()
